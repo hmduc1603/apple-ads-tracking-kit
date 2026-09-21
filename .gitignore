@@ -1,0 +1,7 @@
+# Swift Package Manager / Xcode build artifacts
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+Package.resolved
