@@ -1,37 +1,41 @@
 # AdTrackingKit
 
-Purchase-triggered Apple Search Ads attribution for iOS, reporting into the K&D Labs
-reporting backend.
+Apple Search Ads campaign attribution for iOS, reporting into the K&D Labs reporting backend.
+It feeds the ROAS / Spend / Revenue per campaign view on the dashboard's App Detail page.
 
-The attribution token is minted and sent **only when StoreKit2 confirms a purchase**, never at
-install time. The token and the transaction travel in one request, so the backend can resolve
-the campaign and store it alongside the revenue in a single write — no install-tracking step,
-no revenue webhook.
+The app reports **one thing, once per install**: the AdServices attribution token, together
+with a per-install `appAccountToken` UUID. Revenue is not reported by the app at all. Apple
+delivers every purchase, renewal and refund to the backend as an App Store Server Notification,
+and stamps each one with the `appAccountToken` the app set on the purchase. That UUID ties the
+revenue to the campaign.
 
 ```
-StoreKit2 verifies a transaction
+App launch (until acknowledged)
         │
         ▼
-AdTrackingKit  ──  mints AAAttribution token, bundles it with the purchase
+POST /api/attribution  { bundleId, appAccountToken, attributionToken }
+        │               backend resolves the token with Apple → campaign, stored per UUID
+        ▼
+product.purchase(options: [.appAccountToken(uuid)])
         │
         ▼
-POST /api/purchases  ──▶  backend resolves the token against Apple's
-                          attribution API and writes one purchase_events row
-        │
+Apple ──▶ POST /api/app-store/notifications/<per-app token>   (ASSN V2, signed JWS)
+        │   every transaction carries the same appAccountToken
         ▼
-GET /api/asa/campaigns  ──▶  ROAS / Spend / Revenue per campaign in the dashboard
+Dashboard: revenue joined to campaign on appAccountToken
 ```
 
-Why purchase-time minting works: `AAAttribution.attributionToken()` is not a session token.
-Every token issued on a device resolves to the *same* install attribution record for as long as
-the app stays installed — so a token fetched during a purchase months after the download still
-names the campaign that won it.
+Renewals that happen while the app is closed are included, because Apple sends them
+server-to-server.
 
 ## Requirements
 
 - iOS 17+
-- Works on a real device. The simulator has no AdServices attribution record, so purchases
-  made there are reported unattributed.
+- A real device for attribution. The simulator has no AdServices record, so a simulator
+  install is reported as `no_token`. Its purchases still count as revenue, but without a
+  campaign.
+- On the backend: the app is registered (Apps tab), `INGEST_API_KEY` is set, and the app's
+  App Store Server Notifications URL points at the backend (Apps → Configure).
 
 ## Install
 
@@ -44,13 +48,12 @@ https://github.com/hmduc1603/apple-ads-tracking-kit
 Or declare it in a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/hmduc1603/apple-ads-tracking-kit.git", from: "1.0.0")
+.package(url: "https://github.com/hmduc1603/apple-ads-tracking-kit.git", from: "2.0.0")
 ```
 
 ## Usage
 
-One call. The kit installs its own `Transaction.updates` listener and sweeps
-`Transaction.currentEntitlements` on launch, so there is nothing to forward by hand.
+### 1. Start the kit at launch
 
 ```swift
 import AdTrackingKit
@@ -69,62 +72,56 @@ struct YourApp: App {
 }
 ```
 
-`bundleId` defaults to the host app's own bundle identifier, which is what the backend matches
-against its app registry — so an app already visible in the dashboard needs no extra wiring.
+The kit sends the report on launch and again each time the app becomes active, until the
+backend acknowledges it. After that it sends nothing. A `202` reply (Apple hasn't provisioned
+the record yet) counts as acknowledged, because the backend keeps resolving it on its own.
 
-### If you already run your own transaction listener
+`bundleId` defaults to the host app's bundle identifier, which the backend matches against
+its app registry.
 
-Tell the kit not to install a second one, and hand it transactions yourself:
+### 2. Attach the appAccountToken to every purchase
 
-```swift
-AdTrackingKit.shared.start(config: config, observeTransactions: false)
-
-for await result in Transaction.updates {
-    guard case .verified(let transaction) = result else { continue }
-    AdTrackingKit.shared.reportPurchase(transaction)
-    await transaction.finish()
-}
-```
-
-`reportPurchase(_:)` never throws and returns immediately. It does **not** call
-`transaction.finish()` — entitlement lifecycle stays yours.
-
-### Recovering failed sends sooner
-
-Failed reports are persisted and retried on the next launch. To also retry on foreground:
+Purchases without the token still show up as revenue, but they can't be tied to a campaign.
 
 ```swift
-.onChange(of: scenePhase) { phase in
-    if phase == .active { Task { await AdTrackingKit.shared.flushPending() } }
-}
+let result = try await AdTrackingKit.shared.purchase(product)
 ```
 
-### App Tracking Transparency
+Or, if you call StoreKit yourself:
 
-Not required. Apple Search Ads attribution via AdServices resolves regardless of ATT status, so
-`autoRequestATT` defaults to `false` and the kit shows no prompt. Set it to `true` only if you
-want the IDFA attached to purchases; the ATT status is reported either way.
+```swift
+let result = try await product.purchase(options: [AdTrackingKit.shared.appAccountTokenOption])
+```
+
+With StoreKit 1, set `payment.applicationUsername = AdTrackingKit.shared.appAccountToken.uuidString`.
+Apple carries a UUID-formatted `applicationUsername` through as the `appAccountToken`.
+
+The kit never finishes transactions; handling entitlements is up to your app.
+
+### Migrating from the dashboard snippet
+
+The kit uses the same UserDefaults keys as the Swift snippet in Apps → Configure
+(`kd.appAccountToken`, `kd.attributionReported`). If you replace the snippet with the kit,
+existing installs keep their UUID and are not reported again.
+
+### Migrating from 1.x
+
+1.x reported each purchase to `POST /api/purchases`. That endpoint no longer exists.
+`reportPurchase(_:)`, the transaction listener, the retry queue, ATT/IDFA collection and
+`autoRequestATT` are gone. Remove any `reportPurchase` calls and pass the `appAccountToken` on
+purchases instead (step 2).
 
 ## What gets sent
 
-One JSON body per purchase: bundle id, a per-install device id, the attribution token, ATT
-status, IDFA/IDFV when available, the StoreKit transaction ids, product id, purchase date,
-price and currency, event type (`purchase` / `renewal` / `upgrade`), trial flag and offer type,
-and the StoreKit environment.
+One JSON body per install: `bundleId`, `appAccountToken`, `attributionToken` (when the device
+can produce one), and `sdkVersion`. It is sent with `Authorization: Bearer <INGEST_API_KEY>`.
+The kit sends no IDFA, no IDFV and no purchase data.
 
-Idempotency is on `transactionId`: the backend dedupes, and the kit keeps a local set of
-already-reported ids so the launch-time entitlements sweep is cheap after the first run.
-
-## Known gap: background renewals
-
-`Transaction.updates` only fires while the app is running or is launched to process a
-transaction. A subscription that auto-renews while the app stays closed will not be reported
-through this path, so campaign ROAS under-reports renewal revenue. The fix is Apple's App Store
-Server Notifications V2 (server-to-server, no client involvement); the backend's
-`purchase_events` table is already shaped to accept those rows when that lands.
+The `appAccountToken` is stored in UserDefaults, not the Keychain, so a reinstall gets a fresh
+UUID and a fresh attribution. That matches how AdServices treats a reinstall.
 
 ## Tests
 
 ```bash
-swift test
+xcodebuild test -scheme AdTrackingKit -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
