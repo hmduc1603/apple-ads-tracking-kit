@@ -83,6 +83,20 @@ its app registry.
 
 Purchases without the token still show up as revenue, but they can't be tied to a campaign.
 
+**Apps built on IOSBaseKit** buy through `PurchaseService`, which doesn't know about this kit.
+Hand it the token at launch, next to `purchaseService.recorder = self`, and every
+`purchaseService.purchase(product:isIntroSub:)` carries it from then on:
+
+```swift
+purchaseService.recorder = self
+purchaseService.appAccountToken = AdTrackingKit.shared.appAccountToken
+```
+
+This needs IOSBaseKit `8b48374` or later. Without this line, attribution still reports, but no
+revenue is ever tied to a campaign — an easy miss, since nothing fails.
+
+Otherwise, let the kit make the purchase:
+
 ```swift
 let result = try await AdTrackingKit.shared.purchase(product)
 ```
