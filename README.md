@@ -1,5 +1,11 @@
 # AdTrackingKit
 
+> **Deprecated.** This kit now ships inside [IOSBaseKit](https://github.com/hmduc1603/IOSBaseKit)
+> as `AdTrackingService`. New projects should use IOSBaseKit only. To migrate: remove this
+> package, replace `AdTrackingKit.shared` with `AdTrackingService.shared` and
+> `import AdTrackingKit` with `import IOSBaseKit`. The UserDefaults keys are unchanged, so
+> existing installs keep their `appAccountToken` and are not reported again.
+
 Apple Search Ads campaign attribution for iOS, reporting into the K&D Labs reporting backend.
 It feeds the ROAS / Spend / Revenue per campaign view on the dashboard's App Detail page.
 
